@@ -169,7 +169,7 @@ struct BlackHole
 // x = engine.width / 2
 // y = 0
 // The mass value follows the value shown in this stage of the video.
-BlackHole SagA(vec2( engine.width / 2.0f, 0.0f), 8.54e36);
+BlackHole SagA(vec2(0.0f, 0.0f), 8.54e36);
 
 /*
 x, y -> current Cartesian position of the ray
@@ -181,15 +181,25 @@ Gravity has not been implemented yet.
 
 struct Ray
 {
-    // Store the current position as separate x and y values.
-    double x;
-    double y;
-    // Direction of travel.
+    // Store the current position and polar position.
+    double x; double y;
+    double r; double phi;
+    // First derivatives with respect to the affine parameter
+    double dr; double dphi;
+    // Original Cartesian direction
     vec2 dir;
     // Store every previous position of the ray.
     std::vector<vec2> trail;
     // Initialize the ray from a starting position and a direction vector.
-    Ray(vec2 pos, vec2 direction): x(pos.x), y(pos.y),dir(direction){}
+    Ray(vec2 pos, vec2 direction): x(pos.x), y(pos.y),dir(direction)
+    {
+        r = std::hypot(x, y);
+        phi = glm::atan(y, x);
+
+        // Convert the initial Cartesian direction into radial and angular rates.
+        dr = c * (x * dir.x + y * dir.y) / r;
+        dphi = c * (x * dir.y - y * dir.x) / (r * r);
+    }
 
     // Draw the ray as a single point.
     void draw()
@@ -230,13 +240,30 @@ struct Ray
     }
 
     // Advance the ray by one simulation step.
-    void step()
+    void step(double r_s, double dLambda)
     {
+        if(r<r_s) return;
+        double d2r = r * dphi * dphi - (c * c * r_s) / (2.0 * r * r);
+        double d2phi = -2.0 * dr * dphi / r;
+        
+        dr += d2r * dLambda;
+        dphi += d2phi * dLambda;
+
+        r += dr * dLambda;
+        phi += dphi * dLambda;
+
+        x = std::cos(phi) * r;
+        y = std::sin(phi) * r;
+        /*
+        // Recalculate the ray's current distance from the black hole before advancing it.
+        r = std::hypot(x, y);
+        if(r < SagA.r_s) return;
         // Move along the x component of the direction
         x += dir.x * c;
         // Move along the y component of the direction
         y += dir.y * c;
         // Save the new Cartesian position in the trail. Later draw() will connect all of these points
+        */
         trail.push_back(vec2(static_cast<float>(x), static_cast<float>(y)));
     }
 };
@@ -246,9 +273,12 @@ std::vector<Ray> rays;
 
 int main()
 {
-    // Create the first ray.
-    rays.push_back(Ray(vec2(-engine.width, 0.0f),vec2(1.0f, 0.0f)));
-
+    for(float y = -engine.height; y< engine.height; y+= 1e10f)
+    {
+        // Create the first ray.
+        rays.push_back(Ray(vec2(-engine.width, y),vec2(1.0f, 0.0f)));
+    }
+    
     while (!glfwWindowShouldClose(engine.window))
     {
         // Clear the frame and configure the 2D projection
@@ -259,7 +289,7 @@ int main()
         for (auto &ray : rays)
         {
             ray.draw();
-            ray.step();
+            ray.step(SagA.r_s, 1e-1);
         }
         // Display the completed frame
         glfwSwapBuffers(engine.window);
