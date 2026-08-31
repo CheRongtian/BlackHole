@@ -271,6 +271,68 @@ struct Ray
 // Store rays in a vector.
 std::vector<Ray> rays;
 
+// Returns the derivatives of the current four-value state.
+void geodesic(Ray &ray, double rhs[4], double r_s)
+{
+    rhs[0] = ray.dr;
+    rhs[1] = ray.dphi;
+    rhs[2] = ray.r * ray.dphi * ray.dphi - (c * c * r_s) / (2.0 * ray.r *ray.r);
+    rhs[3] = -2.0 * ray.dr * ray.dphi / ray.r;
+}
+
+// Create a temporary state by adding a sacled derivative to the original state
+void addState(const double a[4], const double b[4], double factor, double out[4])
+{
+    for(int i=0; i<4; i++)
+    {
+        out[i] = a[i] + factor * b[i];
+    }
+}
+
+// Evaluate the geodesic four times before accepting the next ray state.
+void rk4Step(Ray &ray, double dLambda, double r_s)
+{
+    if(ray.r < r_s) return;
+    
+    double y0[4] = {ray.r, ray.phi, ray.dr, ray.dphi};
+    double k1[4], k2[4], k3[4], k4[4], temp[4];
+
+    geodesic(ray, k1, r_s);
+    addState(y0, k1, dLambda/2.0, temp);
+    Ray r2 = ray;
+    r2.r = temp[0];
+    r2.phi = temp[1];
+    r2.dr = temp[2];
+    r2.dphi = temp[3];
+    geodesic(r2, k2, r_s);
+
+    addState(y0, k2, dLambda/2.0, temp);
+    Ray r3 = ray;
+    r3.r = temp[0];
+    r3.phi = temp[1];
+    r3.dr = temp[2];
+    r3.dphi = temp[3];
+    geodesic(r3, k3, r_s);
+
+    addState(y0, k3, dLambda/2.0, temp);
+    Ray r4 = ray;
+    r4.r = temp[0];
+    r4.phi = temp[1];
+    r4.dr = temp[2];
+    r4.dphi = temp[3];
+    geodesic(r4, k4, r_s);
+
+    ray.r += (dLambda/6.0)*(k1[0] + 2*k2[0] + 2*k3[0] + k4[0]);
+    ray.phi += (dLambda/6.0)*(k1[1] + 2*k2[1] + 2*k3[1] + k4[1]);
+    ray.dr += (dLambda/6.0)*(k1[2] + 2*k2[2] + 2*k3[2] + k4[2]);
+    ray.dphi += (dLambda/6.0)*(k1[3] + 2*k2[3] + 2*k3[3] + k4[3]);
+
+    // Keep the existing Cartesian positiion and trail synchronized with the accepted RK4 state
+    ray.x = std::cos(ray.phi) * ray.r;
+    ray.y = std::sin(ray.phi) * ray.r;
+    ray.trail.push_back(vec2(static_cast<float>(ray.x), static_cast<float>(ray.y)));
+}
+
 int main()
 {
     for(float y = -engine.height; y< engine.height; y+= 1e10f)
@@ -289,7 +351,8 @@ int main()
         for (auto &ray : rays)
         {
             ray.draw();
-            ray.step(SagA.r_s, 1e-1);
+            //ray.step(SagA.r_s, 1e-1);
+            rk4Step(ray, 1e-1, SagA.r_s);
         }
         // Display the completed frame
         glfwSwapBuffers(engine.window);
