@@ -1,6 +1,8 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #include <iostream>
 #include <cmath>
 #include <cstdlib>
@@ -28,12 +30,17 @@ using Clock = std::chrono::high_resolution_clock;
 
 static constexpr int METAL_RENDER_WIDTH = 400;          // 800->400
 static constexpr int METAL_RENDER_HEIGHT = 300;         // 600->300
-static constexpr uint32_t METAL_MAX_STEPS = 18000;       // 10000~20000->18000
-static constexpr double METAL_D_LAMBDA_METERS = 1e7;
-static constexpr double METAL_ESCAPE_R_METERS = 2.5e11;
+static constexpr uint32_t TEMPORAL_SAMPLE_COUNT = 8;
+static constexpr uint32_t METAL_MAX_STEPS = 16000;
+static constexpr double METAL_D_LAMBDA_METERS = 5.0e7;
+static constexpr double METAL_ESCAPE_R_METERS = 8.0e11;
 static constexpr float METAL_DISK_R1_RS = 3.0f;         // disk_r1->2.5 * r_s
-static constexpr float METAL_DISK_R2_RS = 5.0f;         // disk_r2->5.0 * r_s
-static constexpr float METAL_GRID_STEP_RS = 0.75f;
+static constexpr float METAL_DISK_R2_RS = 4.5f;         // disk_r2->5.0 * r_s
+
+static constexpr int GRID_HALF_CELLS = 32;
+static constexpr float GRID_STEP_RS = 1.5f;
+static constexpr float GRID_WELL_DEPTH_RS = 9.0f;
+static constexpr float GRID_WELL_RADIUS_RS = 10.0f;
 
 struct Camera
 {
@@ -42,7 +49,7 @@ struct Camera
     float fovY;
     float azimuth, elevation, radius;
 
-    float minRadius = 2e10f, maxRadius = 3e11f; // minRadius = 1e12f, maxRadius = 1e20f
+    float minRadius = 1.0e11f, maxRadius = 1.2e12f;
 
     bool dragging = false;
     bool panning = false;
@@ -55,9 +62,10 @@ struct Camera
 
     // Camera() : azimuth(0), elevation(M_PI / 2.0f), radius(6.34194e10f)
     // Camera() : fovY(60.0f), azimuth(0), elevation(M_PI / 2.0f), radius(6.34194e10f)
-    Camera() : fovY(60.0f), azimuth(0), elevation(M_PI / 3.0f), radius(1.8e11f)
+    Camera() : fovY(75.0f), azimuth(M_PI / 2.0f), elevation(M_PI / 3.0f), radius(4.5e11f)
     {
-        target=vec3(0, 0, 0);
+        // Frame the black hole and the reference object at x = 4e11 in the same view.
+        target=vec3(8.0e10f, 0.0f, 0.0f);
         updateVectors();
     }
 
@@ -117,15 +125,21 @@ struct Engine
     float width = 1e11f;
     float height = 7.5e10f;
 
-    // The 3D ray tracer will produce an RGB image instead of drawing the ray paths directly with OpenGL.
+    // The 3D ray tracer produces an RGBA image that is composited over the OpenGL grid.
     // quadVAO / quadVBO: Store the full-screen quad used to display the image.
-    // texture: Stores the RGB pixel buffer on the GPU.
+    // texture: Stores the RGBA pixel buffer on the GPU.
     // shaderProgram: Draws the texture onto the full-screen quad.
 
     GLuint quadVAO = 0;
     GLuint quadVBO = 0;
     GLuint texture = 0;
     GLuint shaderProgram = 0;
+
+    GLuint gridVAO = 0;
+    GLuint gridVBO = 0;
+    GLuint gridEBO = 0;
+    GLuint gridShaderProgram = 0;
+    GLsizei gridIndexCount = 0;
 
     Engine()
     {
@@ -158,6 +172,7 @@ struct Engine
 
         // Make this window's OpenGL context current
         glfwMakeContextCurrent(window);
+        glfwSwapInterval(1);
 
         // GLEW must be initialized after an OpenGL context has been created.
         glewExperimental = GL_TRUE;
@@ -170,8 +185,10 @@ struct Engine
             std::exit(EXIT_FAILURE);
         }
         
-        // Create the rendering pipeline used to display the RGB pixel buffer.
+        // Create the rendering pipelines used by the ray image and the perspective grid.
         shaderProgram = createShaderProgram();
+        gridShaderProgram = createGridShaderProgram();
+        createPerspectiveGrid();
 
         // Create a full-screen quad.
         float quadVerices[] =
@@ -209,13 +226,25 @@ struct Engine
         glGenTextures(1, &texture);
         glBindTexture(GL_TEXTURE_2D, texture);
 
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);   
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-        // Allocate texture memory now. Actual RGB values will be uploaded by renderScene()
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, WIDTH, HEIGHT, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        // Keep the texture at the native Metal resolution. OpenGL performs the 2x upscale.
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA8,
+            METAL_RENDER_WIDTH,
+            METAL_RENDER_HEIGHT,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            nullptr
+        );
         glBindTexture(GL_TEXTURE_2D, 0);
     }
 
@@ -246,9 +275,64 @@ struct Engine
 
             uniform sampler2D screenTexture;
 
+            float edgeLuma(vec4 color)
+            {
+                // Alpha also exposes the opaque black-hole edge to FXAA.
+                return dot(color.rgb, vec3(0.299, 0.587, 0.114)) + color.a * 0.25;
+            }
+
             void main()
             {
-                FragColor = texture(screenTexture, TexCoord);
+                vec2 inverseSize = 1.0 / vec2(textureSize(screenTexture, 0));
+
+                vec4 center = texture(screenTexture, TexCoord);
+                vec4 northWest = texture(screenTexture, TexCoord + vec2(-1.0,  1.0) * inverseSize);
+                vec4 northEast = texture(screenTexture, TexCoord + vec2( 1.0,  1.0) * inverseSize);
+                vec4 southWest = texture(screenTexture, TexCoord + vec2(-1.0, -1.0) * inverseSize);
+                vec4 southEast = texture(screenTexture, TexCoord + vec2( 1.0, -1.0) * inverseSize);
+
+                float lumaCenter = edgeLuma(center);
+                float lumaNorthWest = edgeLuma(northWest);
+                float lumaNorthEast = edgeLuma(northEast);
+                float lumaSouthWest = edgeLuma(southWest);
+                float lumaSouthEast = edgeLuma(southEast);
+                float lumaMinimum = min(
+                    lumaCenter,
+                    min(min(lumaNorthWest, lumaNorthEast), min(lumaSouthWest, lumaSouthEast))
+                );
+                float lumaMaximum = max(
+                    lumaCenter,
+                    max(max(lumaNorthWest, lumaNorthEast), max(lumaSouthWest, lumaSouthEast))
+                );
+
+                if(lumaMaximum - lumaMinimum < 0.035)
+                {
+                    FragColor = center;
+                    return;
+                }
+
+                vec2 direction;
+                direction.x = -((lumaNorthWest + lumaNorthEast) - (lumaSouthWest + lumaSouthEast));
+                direction.y =  ((lumaNorthWest + lumaSouthWest) - (lumaNorthEast + lumaSouthEast));
+
+                float directionReduce = max(
+                    (lumaNorthWest + lumaNorthEast + lumaSouthWest + lumaSouthEast) * 0.0078125,
+                    0.0009765625
+                );
+                float inverseDirectionMinimum = 1.0 / (min(abs(direction.x), abs(direction.y)) + directionReduce);
+                direction = clamp(direction * inverseDirectionMinimum, vec2(-4.0), vec2(4.0)) * inverseSize;
+
+                vec4 resultA = 0.5 * (
+                    texture(screenTexture, TexCoord + direction * (1.0 / 3.0 - 0.5)) +
+                    texture(screenTexture, TexCoord + direction * (2.0 / 3.0 - 0.5))
+                );
+                vec4 resultB = resultA * 0.5 + 0.25 * (
+                    texture(screenTexture, TexCoord + direction * -0.5) +
+                    texture(screenTexture, TexCoord + direction *  0.5)
+                );
+
+                float lumaResultB = edgeLuma(resultB);
+                FragColor = (lumaResultB < lumaMinimum || lumaResultB > lumaMaximum) ? resultA : resultB;
             }
         )";
 
@@ -294,7 +378,7 @@ struct Engine
         if(!linkSuccess)
         {
             char infoLog[1024];
-            glGetProgramInfoLog(vertexShader, 1024, nullptr, infoLog);
+            glGetProgramInfoLog(program, 1024, nullptr, infoLog);
             std::cerr << "Shader program linking failed:\n" << infoLog << "\n";
         }
 
@@ -304,8 +388,185 @@ struct Engine
         return program;
     }
 
-    // Upload the CPU RGB pixel buffer into the OpenGL texture and display it using the full-screen quad
-    void renderScene(const std::vector<unsigned char> &pixels)
+    GLuint createGridShaderProgram()
+    {
+        const char *vertexShaderSource = R"(
+            #version 410 core
+
+            layout(location = 0) in vec3 aPosition;
+
+            uniform mat4 uMVP;
+
+            void main()
+            {
+                gl_Position = uMVP * vec4(aPosition, 1.0);
+            }
+        )";
+
+        const char *fragmentShaderSource = R"(
+            #version 410 core
+
+            out vec4 FragColor;
+
+            uniform vec4 uGridColor;
+
+            void main()
+            {
+                FragColor = uGridColor;
+            }
+        )";
+
+        auto compileShader = [](GLenum type, const char *source, const char *label)
+        {
+            GLuint shader = glCreateShader(type);
+            glShaderSource(shader, 1, &source, nullptr);
+            glCompileShader(shader);
+
+            GLint success = GL_FALSE;
+            glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+
+            if(!success)
+            {
+                char infoLog[1024];
+                glGetShaderInfoLog(shader, sizeof(infoLog), nullptr, infoLog);
+                std::cerr << label << " compilation failed:\n" << infoLog << "\n";
+            }
+
+            return shader;
+        };
+
+        GLuint vertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource, "Grid vertex shader");
+        GLuint fragmentShader = compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource, "Grid fragment shader");
+        GLuint program = glCreateProgram();
+
+        glAttachShader(program, vertexShader);
+        glAttachShader(program, fragmentShader);
+        glLinkProgram(program);
+
+        GLint success = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &success);
+
+        if(!success)
+        {
+            char infoLog[1024];
+            glGetProgramInfoLog(program, sizeof(infoLog), nullptr, infoLog);
+            std::cerr << "Grid shader link failed:\n" << infoLog << "\n";
+        }
+
+        glDeleteShader(vertexShader);
+        glDeleteShader(fragmentShader);
+
+        return program;
+    }
+
+    void createPerspectiveGrid()
+    {
+        const int sideVertexCount = GRID_HALF_CELLS * 2 + 1;
+        std::vector<vec3> vertices;
+        std::vector<GLuint> indices;
+
+        vertices.reserve(static_cast<size_t>(sideVertexCount * sideVertexCount));
+
+        for(int zIndex = 0; zIndex < sideVertexCount; ++zIndex)
+        {
+            float z = static_cast<float>(zIndex - GRID_HALF_CELLS) * GRID_STEP_RS;
+
+            for(int xIndex = 0; xIndex < sideVertexCount; ++xIndex)
+            {
+                float x = static_cast<float>(xIndex - GRID_HALF_CELLS) * GRID_STEP_RS;
+                float radius = std::sqrt(x * x + z * z);
+                float normalizedRadius = radius / GRID_WELL_RADIUS_RS;
+                float y = -GRID_WELL_DEPTH_RS / (1.0f + normalizedRadius * normalizedRadius);
+
+                vertices.emplace_back(x, y, z);
+            }
+        }
+
+        auto vertexIndex = [sideVertexCount](int zIndex, int xIndex)
+        {
+            return static_cast<GLuint>(zIndex * sideVertexCount + xIndex);
+        };
+
+        indices.reserve(static_cast<size_t>(sideVertexCount * (sideVertexCount - 1) * 4));
+
+        for(int zIndex = 0; zIndex < sideVertexCount; ++zIndex)
+        {
+            for(int xIndex = 0; xIndex < sideVertexCount - 1; ++xIndex)
+            {
+                indices.push_back(vertexIndex(zIndex, xIndex));
+                indices.push_back(vertexIndex(zIndex, xIndex + 1));
+            }
+        }
+
+        for(int xIndex = 0; xIndex < sideVertexCount; ++xIndex)
+        {
+            for(int zIndex = 0; zIndex < sideVertexCount - 1; ++zIndex)
+            {
+                indices.push_back(vertexIndex(zIndex, xIndex));
+                indices.push_back(vertexIndex(zIndex + 1, xIndex));
+            }
+        }
+
+        gridIndexCount = static_cast<GLsizei>(indices.size());
+
+        glGenVertexArrays(1, &gridVAO);
+        glGenBuffers(1, &gridVBO);
+        glGenBuffers(1, &gridEBO);
+
+        glBindVertexArray(gridVAO);
+
+        glBindBuffer(GL_ARRAY_BUFFER, gridVBO);
+        glBufferData(
+            GL_ARRAY_BUFFER,
+            static_cast<GLsizeiptr>(vertices.size() * sizeof(vec3)),
+            vertices.data(),
+            GL_STATIC_DRAW
+        );
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gridEBO);
+        glBufferData(
+            GL_ELEMENT_ARRAY_BUFFER,
+            static_cast<GLsizeiptr>(indices.size() * sizeof(GLuint)),
+            indices.data(),
+            GL_STATIC_DRAW
+        );
+
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vec3), nullptr);
+        glEnableVertexAttribArray(0);
+
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+
+    void drawPerspectiveGrid(double schwarzschildRadius, float aspect)
+    {
+        if(schwarzschildRadius <= 0.0 || gridIndexCount == 0) return;
+
+        float inverseRadius = static_cast<float>(1.0 / schwarzschildRadius);
+        vec3 eye = camera.pos * inverseRadius;
+        vec3 target = camera.target * inverseRadius;
+
+        mat4 projection = glm::perspective(glm::radians(camera.fovY), aspect, 0.05f, 200.0f);
+        mat4 view = glm::lookAt(eye, target, vec3(0.0f, 1.0f, 0.0f));
+        mat4 mvp = projection * view;
+
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        glUseProgram(gridShaderProgram);
+        glUniformMatrix4fv(glGetUniformLocation(gridShaderProgram, "uMVP"), 1, GL_FALSE, glm::value_ptr(mvp));
+        glUniform4f(glGetUniformLocation(gridShaderProgram, "uGridColor"), 0.86f, 0.53f, 0.38f, 0.78f);
+
+        glBindVertexArray(gridVAO);
+        glLineWidth(1.0f);
+        glDrawElements(GL_LINES, gridIndexCount, GL_UNSIGNED_INT, nullptr);
+        glBindVertexArray(0);
+    }
+
+    // Draw the 3D grid first, then blend the ray-traced RGBA image over it.
+    void renderScene(const std::vector<unsigned char> &pixels, double schwarzschildRadius)
     {
         // glViewport(0, 0, WIDTH, HEIGHT);
         // glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -319,14 +580,33 @@ struct Engine
         glViewport(0, 0, framebufferWidth, framebufferHeight);
 
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        float aspect = static_cast<float>(framebufferWidth) / static_cast<float>(framebufferHeight);
+        drawPerspectiveGrid(schwarzschildRadius, aspect);
 
         // Copy the current CPU pixel buffer into the texture.
         glBindTexture(GL_TEXTURE_2D, texture); 
 
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WIDTH, HEIGHT,GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+        glTexSubImage2D(
+            GL_TEXTURE_2D,
+            0,
+            0,
+            0,
+            METAL_RENDER_WIDTH,
+            METAL_RENDER_HEIGHT,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            pixels.data()
+        );
 
-        // Draw the texture across the entire window
+        // Transparent background pixels preserve the grid. Opaque ray hits cover it.
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glEnable(GL_BLEND);
+        // Temporal coverage and FXAA produce premultiplied-alpha edge pixels.
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
         glUseProgram(shaderProgram);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texture);
@@ -338,6 +618,8 @@ struct Engine
         glDrawArrays(GL_TRIANGLES, 0, 6);
 
         glBindVertexArray(0);
+        glDisable(GL_BLEND);
+        glDepthMask(GL_TRUE);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
@@ -376,6 +658,10 @@ struct Engine
         if(texture) glDeleteTextures(1, &texture);
         if(quadVBO) glDeleteBuffers(1, &quadVBO);
         if(quadVAO) glDeleteVertexArrays(1, &quadVAO);
+        if(gridEBO) glDeleteBuffers(1, &gridEBO);
+        if(gridVBO) glDeleteBuffers(1, &gridVBO);
+        if(gridVAO) glDeleteVertexArrays(1, &gridVAO);
+        if(gridShaderProgram) glDeleteProgram(gridShaderProgram);
         if(shaderProgram) glDeleteProgram(shaderProgram);
         if(window) glfwDestroyWindow(window);
         glfwTerminate();
@@ -396,9 +682,7 @@ struct BlackHole
     // Schwarzschild radius
     double r_s;
 
-    BlackHole(vec3 pos, double m)
-        : position(pos),
-          mass(m)
+    BlackHole(vec3 pos, double m): position(pos), mass(m)
     {
         /*
         Calculate the Schwarzschild radius:
@@ -453,6 +737,32 @@ struct BlackHole
 // y = 0
 // The mass value follows the value shown in this stage of the video.
 BlackHole SagA(vec3(0.0f, 0.0f, 0.0f), 8.54e36);
+
+// Scene objects use meters on the CPU. They are converted to Schwarzschild-radius
+// units before being sent to the Metal ray tracer.
+struct alignas(16) Object
+{
+    vec4 posRadius;
+    vec4 color;
+    float mass;
+    float alignmentPadding[3];
+    vec3 velocity;
+    float velocityPadding;
+};
+
+static_assert(sizeof(Object) == 64, "Object must match the Metal buffer layout");
+
+std::vector<Object> objects =
+{
+    {
+        vec4(4.0e11f, 0.0f, 0.0f, 4.0e10f),
+        vec4(1.0f, 1.0f, 0.0f, 1.0f),
+        0.0f,
+        {0.0f, 0.0f, 0.0f},
+        vec3(0.0f),
+        0.0f
+    }
+};
 
 /*
 x, y -> current Cartesian position of the ray
@@ -676,7 +986,7 @@ void setupCameraCallbacks(GLFWwindow* window)
 
     glfwSetMouseButtonCallback(window, [](GLFWwindow* window, int button, int action, int mods)
     {
-        if(button == GLFW_MOUSE_BUTTON_MIDDLE)
+        if(button == GLFW_MOUSE_BUTTON_LEFT)
         {
             if(action == GLFW_PRESS)
             {
@@ -739,13 +1049,22 @@ struct MetalRaytraceParams
 
     float diskR1;
     float diskR2;
-    float gridStep;
+    uint32_t objectCount;
     float pad2;
+
+    uint32_t sampleIndex;
+    float jitterX;
+    float jitterY;
+    float pad3;
 };
+
+static_assert(sizeof(MetalRaytraceParams) == 96, "MetalRaytraceParams must match the Metal layout");
 
 static const char* METAL_RAYTRACE_SHADER = R"METAL(
 #include <metal_stdlib>
 using namespace metal;
+
+constant uint TEMPORAL_SAMPLE_COUNT = 8;
 
 struct Params
 {
@@ -771,8 +1090,21 @@ struct Params
 
     float diskR1;
     float diskR2;
-    float gridStep;
+    uint objectCount;
     float pad2;
+
+    uint sampleIndex;
+    float jitterX;
+    float jitterY;
+    float pad3;
+};
+
+struct Object
+{
+    float4 posRadius;
+    float4 color;
+    float mass;
+    float3 velocity;
 };
 
 struct RayState
@@ -815,25 +1147,71 @@ float3 rayCartesian(RayState ray)
     );
 }
 
-bool interceptDisk(float3 oldPos, float3 newPos, constant Params& p)
-{
-    bool crossed = (oldPos.y * newPos.y < 0.0f);
-    float diskRadius = length(float2(newPos.x, newPos.z));
-
-    return crossed && (diskRadius >= p.diskR1 && diskRadius <= p.diskR2);
-}
-
-bool interceptGrid(float3 oldPos, float3 newPos, constant Params& p)
+bool interceptDisk(float3 oldPos, float3 newPos, constant Params& p, thread float& radiusAtHit)
 {
     bool crossed = (oldPos.y * newPos.y < 0.0f);
     if(!crossed) return false;
-    float diskRadius = length(float2(newPos.x, newPos.z));
-    if(diskRadius <= p.diskR2)return false;
 
-    float gx = fabs(newPos.x / p.gridStep - round(newPos.x / p.gridStep));
-    float gz = fabs(newPos.z / p.gridStep - round(newPos.z / p.gridStep));
+    float denominator = newPos.y - oldPos.y;
+    if(fabs(denominator) < 1e-8f) return false;
 
-    return (gx < 0.035f || gz < 0.035f);
+    float crossingT = clamp(-oldPos.y / denominator, 0.0f, 1.0f);
+    float3 crossingPoint = mix(oldPos, newPos, crossingT);
+    float diskRadius = length(float2(crossingPoint.x, crossingPoint.z));
+
+    if(diskRadius < p.diskR1 || diskRadius > p.diskR2) return false;
+
+    radiusAtHit = diskRadius;
+    return true;
+}
+
+bool interceptObject(
+    float3 oldPos,
+    float3 newPos,
+    constant Object* objects,
+    uint objectCount,
+    thread float4& objectColor,
+    thread float3& hitCenter,
+    thread float& hitRadius,
+    thread float3& hitPoint
+)
+{
+    float3 segment = newPos - oldPos;
+    float a = dot(segment, segment);
+    if(a < 1e-12f) return false;
+
+    bool foundHit = false;
+    float closestT = 2.0f;
+
+    for(uint objectIndex = 0; objectIndex < objectCount; ++objectIndex)
+    {
+        float3 center = objects[objectIndex].posRadius.xyz;
+        float radius = objects[objectIndex].posRadius.w;
+        float3 offset = oldPos - center;
+        float b = 2.0f * dot(offset, segment);
+        float c = dot(offset, offset) - radius * radius;
+        float discriminant = b * b - 4.0f * a * c;
+
+        if(discriminant < 0.0f) continue;
+
+        float squareRoot = sqrt(discriminant);
+        float inverseDenominator = 0.5f / a;
+        float nearT = (-b - squareRoot) * inverseDenominator;
+        float farT = (-b + squareRoot) * inverseDenominator;
+        float candidateT = nearT;
+
+        if(candidateT < 0.0f || candidateT > 1.0f) candidateT = farT;
+        if(candidateT < 0.0f || candidateT > 1.0f || candidateT >= closestT) continue;
+
+        closestT = candidateT;
+        objectColor = objects[objectIndex].color;
+        hitCenter = center;
+        hitRadius = radius;
+        hitPoint = oldPos + candidateT * segment;
+        foundHit = true;
+    }
+
+    return foundHit;
 }
 
 RayState makeRay(float3 pos, float3 dir, constant Params& p)
@@ -916,9 +1294,16 @@ void rk4Step(thread RayState& ray, float h, constant Params& p)
     ray.v += (h/6.0f)*(k1.dv+2.0f*k2.dv+2.0f*k3.dv+k4.dv);
 }
 
-kernel void raytraceKernel(device uchar4* output [[buffer(0)]], constant Params& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]])
+kernel void raytraceKernel(
+    device uchar4* output [[buffer(0)]],
+    constant Params& p [[buffer(1)]],
+    constant Object* objects [[buffer(2)]],
+    device float4* accumulation [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+)
 {
     if((gid.x >= p.renderWidth)||(gid.y >= p.renderHeight)) return;
+    if(p.sampleIndex >= TEMPORAL_SAMPLE_COUNT) return;
 
     float3 cameraPos = float3(p.cameraPosX, p.cameraPosY, p.cameraPosZ);
     float3 target = float3(p.targetX, p.targetY, p.targetZ);
@@ -931,15 +1316,23 @@ kernel void raytraceKernel(device uchar4* output [[buffer(0)]], constant Params&
 
     float3 up = normalize(cross(right, forward));
     float tanHalfFov = tan(p.fovYRadians*0.5f);
-    float u = (2.0f*((float(gid.x)+0.5f)/float(p.renderWidth))-1.0f)*p.aspect*tanHalfFov;
-    float v = (1.0f-2.0f*((float(gid.y)+0.5f)/float(p.renderHeight)))*tanHalfFov;
+    float sampleX = float(gid.x) + 0.5f + p.jitterX;
+    float sampleY = float(gid.y) + 0.5f + p.jitterY;
+    float u = (2.0f*(sampleX/float(p.renderWidth))-1.0f)*p.aspect*tanHalfFov;
+    float v = (1.0f-2.0f*(sampleY/float(p.renderHeight)))*tanHalfFov;
     float3 dir = normalize(u*right+v*up+forward);
 
     RayState ray =makeRay(cameraPos, dir, p);
 
-   bool captured = false;
+    bool captured = false;
     bool diskHit = false;
-    bool gridHit = false;
+    bool objectHit = false;
+
+    float diskRadiusAtHit = 0.0f;
+    float4 objectColor = float4(0.0f);
+    float3 hitCenter = float3(0.0f);
+    float hitRadius = 0.0f;
+    float3 objectHitPoint = float3(0.0f);
 
     for(uint i = 0; i < p.maxSteps; i++)
     {
@@ -964,13 +1357,26 @@ kernel void raytraceKernel(device uchar4* output [[buffer(0)]], constant Params&
 
         float3 newPos = rayCartesian(ray);
 
-        if(interceptDisk(oldPos, newPos, p))
+        if(interceptObject(
+            oldPos,
+            newPos,
+            objects,
+            p.objectCount,
+            objectColor,
+            hitCenter,
+            hitRadius,
+            objectHitPoint
+        ))
+        {
+            objectHit = true;
+            break;
+        }
+
+        if(interceptDisk(oldPos, newPos, p, diskRadiusAtHit))
         {
             diskHit = true;
             break;
         }
-
-        if(interceptGrid(oldPos, newPos, p)) gridHit = true;
 
         if(ray.q.x <= p.horizonR * 1.01f)
         {
@@ -980,11 +1386,48 @@ kernel void raytraceKernel(device uchar4* output [[buffer(0)]], constant Params&
     }
 
     uint index = gid.y*p.renderWidth+gid.x;
+    float4 currentColor = float4(0.0f);
 
-    if(diskHit) output[index] = uchar4(255, 115, 20, 255);
-    else if(captured) output[index] = uchar4(0, 0, 0, 255);
-    else if(gridHit) output[index] = uchar4(75, 75, 85, 255);
-    else output[index] = uchar4(0, 0, 0, 255);
+    if(objectHit)
+    {
+        float3 normal = normalize((objectHitPoint - hitCenter) / max(hitRadius, 1e-6f));
+        float3 lightDirection = normalize(float3(-0.35f, 0.80f, 0.48f));
+        float3 viewDirection = normalize(cameraPos - objectHitPoint);
+        float diffuse = max(dot(normal, lightDirection), 0.0f);
+        float3 reflectedLight = reflect(-lightDirection, normal);
+        float specular = pow(max(dot(reflectedLight, viewDirection), 0.0f), 24.0f) * 0.30f;
+        float3 shadedColor = clamp(objectColor.rgb * (0.22f + 0.78f * diffuse) + specular, 0.0f, 1.0f);
+        float objectAlpha = clamp(objectColor.a, 0.0f, 1.0f);
+
+        currentColor = float4(shadedColor * objectAlpha, objectAlpha);
+    }
+    else if(diskHit)
+    {
+        float diskT = clamp((diskRadiusAtHit-p.diskR1)/(p.diskR2-p.diskR1), 0.0f, 1.0f);
+        float3 innerColor = float3(1.0f, 0.15f, 0.01f);
+        float3 outerColor = float3(1.0f, 0.72f, 0.10f);
+        float3 diskColor = mix(innerColor, outerColor, diskT);
+
+        currentColor = float4(diskColor, 1.0f);
+    }
+    else if(captured) currentColor = float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+    float4 accumulatedColor = currentColor;
+
+    if(p.sampleIndex > 0)
+    {
+        float sampleWeight = 1.0f / float(p.sampleIndex + 1);
+        accumulatedColor = mix(accumulation[index], currentColor, sampleWeight);
+    }
+
+    accumulatedColor = clamp(accumulatedColor, 0.0f, 1.0f);
+    accumulation[index] = accumulatedColor;
+    output[index] = uchar4(
+        uchar(accumulatedColor.r * 255.0f + 0.5f),
+        uchar(accumulatedColor.g * 255.0f + 0.5f),
+        uchar(accumulatedColor.b * 255.0f + 0.5f),
+        uchar(accumulatedColor.a * 255.0f + 0.5f)
+    );
 }
 )METAL";
 
@@ -1051,16 +1494,57 @@ public:
             std::exit(EXIT_FAILURE);
         }
 
+        accumulationBuffer =
+            [device
+                newBufferWithLength: METAL_RENDER_WIDTH*METAL_RENDER_HEIGHT*sizeof(float)*4
+                options: MTLResourceStorageModePrivate
+            ];
+
+        if(!accumulationBuffer)
+        {
+            std::cerr<<"Failed to create Metal temporal accumulation buffer.\n";
+            std::exit(EXIT_FAILURE);
+        }
+
         std::cout<<"Metal GPU: "<<[[device name] UTF8String]<<"\n";
         std::cout<<"Metal raytrace resolution: "<<METAL_RENDER_WIDTH<<" x "<<METAL_RENDER_HEIGHT<<"\n";
         std::cout<< "Metal MAX_STEPS: "<< METAL_MAX_STEPS<<" (original CPU value: 10000)"<<"\n";
         std::cout<<"Accretion disk: "<<METAL_DISK_R1_RS<<" r_s -> "<<METAL_DISK_R2_RS<<" r_s"<<"\n";
+        std::cout<<"Temporal anti-aliasing: "<<TEMPORAL_SAMPLE_COUNT<<" samples while camera is still\n";
     }
 
     void render(std::vector<unsigned char>& pixels, int displayWidth, int displayHeight)
     {
         @autoreleasepool
         {
+            const bool cameraChanged =
+                !hasPreviousCamera ||
+                glm::length(camera.pos - previousCameraPos) > 1.0e4f ||
+                glm::length(camera.target - previousCameraTarget) > 1.0e4f ||
+                std::fabs(camera.fovY - previousCameraFovY) > 1.0e-5f;
+
+            if(cameraChanged)
+            {
+                accumulatedSampleCount = 0;
+                previousCameraPos = camera.pos;
+                previousCameraTarget = camera.target;
+                previousCameraFovY = camera.fovY;
+                hasPreviousCamera = true;
+            }
+
+            static constexpr float jitterOffsets[TEMPORAL_SAMPLE_COUNT][2] =
+            {
+                { 0.000f,  0.000f},
+                {-0.250f, -0.250f},
+                { 0.250f,  0.250f},
+                { 0.250f, -0.250f},
+                {-0.250f,  0.250f},
+                {-0.375f,  0.000f},
+                { 0.375f,  0.000f},
+                { 0.000f,  0.000f}
+            };
+
+            uint32_t jitterIndex = std::min(accumulatedSampleCount, TEMPORAL_SAMPLE_COUNT - 1);
             MetalRaytraceParams params{};
             const double invRs = 1.0/SagA.r_s;
             
@@ -1086,8 +1570,22 @@ public:
             params.horizonR =1.0f;
             params.diskR1 = METAL_DISK_R1_RS;
             params.diskR2 = METAL_DISK_R2_RS;
-            params.gridStep = METAL_GRID_STEP_RS;
+            params.objectCount = static_cast<uint32_t>(objects.size());
             params.pad2 = 0.0f;
+            params.sampleIndex = accumulatedSampleCount;
+            params.jitterX = jitterOffsets[jitterIndex][0];
+            params.jitterY = jitterOffsets[jitterIndex][1];
+            params.pad3 = 0.0f;
+
+            std::vector<Object> normalizedObjects = objects;
+
+            for(Object& object : normalizedObjects)
+            {
+                object.posRadius.x = static_cast<float>(object.posRadius.x * invRs);
+                object.posRadius.y = static_cast<float>(object.posRadius.y * invRs);
+                object.posRadius.z = static_cast<float>(object.posRadius.z * invRs);
+                object.posRadius.w = static_cast<float>(object.posRadius.w * invRs);
+            }
 
             id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
             id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
@@ -1095,6 +1593,12 @@ public:
             [encoder setComputePipelineState: pipeline];
             [encoder setBuffer: outputBuffer offset:0 atIndex:0];
             [encoder setBytes: &params length: sizeof(params) atIndex:1];
+            [encoder
+                setBytes: normalizedObjects.data()
+                length: normalizedObjects.size() * sizeof(Object)
+                atIndex:2
+            ];
+            [encoder setBuffer: accumulationBuffer offset:0 atIndex:3];
 
             MTLSize gridSize = MTLSizeMake(METAL_RENDER_WIDTH, METAL_RENDER_HEIGHT, 1);
 
@@ -1115,22 +1619,24 @@ public:
                 return;
             }
 
+            if(accumulatedSampleCount < TEMPORAL_SAMPLE_COUNT)
+                ++accumulatedSampleCount;
+
             const MetalPixelRGBA* gpuPixels = static_cast<const MetalPixelRGBA*>([outputBuffer contents]);
 
-            for(int y = 0;y < displayHeight;y++)
+            for(int y = 0; y < METAL_RENDER_HEIGHT; ++y)
             {
-                // int sourceY = y*METAL_RENDER_HEIGHT/displayHeight;
-                int sourceY = METAL_RENDER_HEIGHT - 1 - y*METAL_RENDER_HEIGHT/displayHeight;
+                int sourceY = METAL_RENDER_HEIGHT - 1 - y;
                 
-                for(int x = 0;x < displayWidth;x++)
+                for(int x = 0; x < METAL_RENDER_WIDTH; ++x)
                 {
-                    int sourceX = x*METAL_RENDER_WIDTH/displayWidth;
-                    const MetalPixelRGBA& sourcePixel = gpuPixels[sourceY*METAL_RENDER_WIDTH+sourceX];
-                    int idx =(y*displayWidth+x)*3;
+                    const MetalPixelRGBA& sourcePixel = gpuPixels[sourceY * METAL_RENDER_WIDTH + x];
+                    int idx = (y * METAL_RENDER_WIDTH + x) * 4;
 
                     pixels[idx + 0] = sourcePixel.r;
                     pixels[idx + 1] = sourcePixel.g;
-                    pixels[idx + 2] =sourcePixel.b;
+                    pixels[idx + 2] = sourcePixel.b;
+                    pixels[idx + 3] = sourcePixel.a;
                 }
             }
         }
@@ -1141,6 +1647,13 @@ private:
     id<MTLCommandQueue> commandQueue = nil;
     id<MTLComputePipelineState> pipeline = nil;
     id<MTLBuffer> outputBuffer = nil;
+    id<MTLBuffer> accumulationBuffer = nil;
+
+    uint32_t accumulatedSampleCount = 0;
+    bool hasPreviousCamera = false;
+    vec3 previousCameraPos = vec3(0.0f);
+    vec3 previousCameraTarget = vec3(0.0f);
+    float previousCameraFovY = 0.0f;
 };
 
 void raytrace(std::vector<unsigned char>& pixels, int W, int H)
@@ -1195,10 +1708,11 @@ void raytrace(std::vector<unsigned char>& pixels, int W, int H)
             }
             */
             
-            int idx = (y * W + x) * 3;
+            int idx = (y * W + x) * 4;
             pixels[idx + 0] = static_cast<unsigned char>(color.r * 255.0f);
             pixels[idx + 1] = static_cast<unsigned char>(color.g * 255.0f);
             pixels[idx + 2] = static_cast<unsigned char>(color.b * 255.0f);
+            pixels[idx + 3] = 255;
         }
     }
 }
@@ -1210,29 +1724,20 @@ int main()
     {
         setupCameraCallbacks(engine.window);
 
-        // Create one RGB entry for every pixel in the window.
-        // WIDTH * HEIGHT pixels, 3bytes for each pixel: R, G and B
-        std::vector<unsigned char>pixels(engine.WIDTH * engine.HEIGHT * 3, 0);
+        // Keep one RGBA entry for every native Metal ray-tracing pixel.
+        std::vector<unsigned char>pixels(METAL_RENDER_WIDTH * METAL_RENDER_HEIGHT * 4, 0);
         MetalRayTracer metalRayTracer;
 
         /*
         // Fill half of the pixel buffer with red. The other half remains black because the vector was initialized with 0
-        for(int i=0; i<engine.WIDTH * engine.HEIGHT / 2; i++)
+        for(int i=0; i<METAL_RENDER_WIDTH * METAL_RENDER_HEIGHT / 2; i++)
         {
-            pixels[i*3 + 0] = 255;
-            pixels[i*3 + 1] = 0;
-            pixels[i*3 + 2] = 0;
+            pixels[i*4 + 0] = 255;
+            pixels[i*4 + 1] = 0;
+            pixels[i*4 + 2] = 0;
+            pixels[i*4 + 3] = 255;
         }
         */
-        
-        // This is the loop structure the 3D ray tracer will use later: every (x,y) pixel will eventually create and simulaye one ray
-        for(int y=0; y<engine.HEIGHT; y++)
-        {
-            for(int x=0; x<engine.WIDTH; x++)
-            {
-                // No ray or colour calculation is added yet.
-            }
-        }
         
         int frameCount = 0;
         auto t0 = Clock::now();
@@ -1241,8 +1746,8 @@ int main()
         while(!glfwWindowShouldClose(engine.window))
         {
             metalRayTracer.render(pixels, engine.WIDTH, engine.HEIGHT);
-            // Upload the RGB pixel array and display it on the full-screen quad.
-            engine.renderScene(pixels);
+            // Upload the RGBA ray image and composite it over the perspective grid.
+            engine.renderScene(pixels, SagA.r_s);
             
             frameCount++;
             auto now = Clock::now();
