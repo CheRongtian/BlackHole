@@ -1,10 +1,22 @@
 #!/bin/bash
-clang++ blackhole.cpp -o blackhole \
-    -std=c++17 \
-    -I/opt/homebrew/include \
-    -L/opt/homebrew/lib \
-    -lglfw \
-    -lGLEW \
-    -framework OpenGL
+set -e
+BREW_PREFIX="$(brew --prefix)"
 
-./blackhole
+clang++ \
+  -std=c++17 \
+  -O3 \
+  -fobjc-arc \
+  BlackHole.mm \
+  -o BlackHole \
+  -I"$BREW_PREFIX/include" \
+  -L"$BREW_PREFIX/lib" \
+  -lglfw \
+  -lGLEW \
+  -framework OpenGL \
+  -framework Cocoa \
+  -framework IOKit \
+  -framework CoreVideo \
+  -framework Metal \
+  -framework Foundation
+
+./BlackHole
