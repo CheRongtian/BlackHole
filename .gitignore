@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Locally compiled executables
+/BlackHole
+/GPUinfoFile/gpuinfo
+/Draft/blackhole
+
+# CMake output
+/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Compiler and diagnostic output
+*.o
+*.obj
+*.d
+*.log
